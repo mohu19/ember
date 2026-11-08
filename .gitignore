@@ -1,0 +1,18 @@
+# 运行时（部署包里才有；仓库只放源码）
+py/
+py32/
+ucrt/
+python38.zip
+
+# 本地数据
+sessions/
+workspace/
+env-profile.txt
+key.txt
+
+# 构建产物
+*.zip
+__pycache__/
+*.pyc
+*.pyo
+*.tmp

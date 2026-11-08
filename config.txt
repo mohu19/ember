@@ -1,0 +1,120 @@
+﻿# ===================== ember 配置 =====================
+# 用记事本改，改完直接保存即可（存成 GBK 或 UTF-8 都能读）。
+# 格式：  名字 = 值       以 # 开头的行是注释。
+# 命令行参数会临时覆盖这里（--yolo / --safe / --model / --api-base / --config 等）。
+
+# ---- API（api_key 必填）----
+api_key =
+api_base = https://api.deepseek.com
+
+# ---- 模型 ----
+# 可用的：deepseek-v4-flash（默认，快而省） / deepseek-v4-pro
+model = deepseek-v4-flash
+thinking = off
+
+# ---- 安全开关（重点）----
+# off = 写文件 / 执行命令前先问你 y/N（更安全；学校机器建议这个）
+# on  = 自动同意所有工具调用，不再打断你（快；但 agent 可以随意改文件、跑命令）
+# 注意：本包发出去的是 on —— 想更稳就改成 off，改完重启生效。
+auto_approve = on
+
+# ---- 超时截断（防止下载/命令一直跑下去卡死）----
+# run_cmd 默认超时（秒）：命令超过这个时间会被连子进程一起杀掉
+cmd_timeout = 120
+# agent 自己最多能要求的超时（秒）：它写 timeout=9999 也只按这个数封顶
+cmd_timeout_max = 600
+# 模型多久没吐数据就判定超时并断开（秒）
+api_timeout = 120
+# 一次提问的总时长上限（秒），到点就停止本轮；0 = 不限
+# v1.8 起默认 1800（30 分钟）：max_rounds=60 时，900 秒平均每轮只剩 15 秒，长任务会被先掐断
+turn_timeout = 1800
+
+# ---- 上下文压缩（v1.7，v1.9 起按 token 算）----
+# 聊久了上下文会满。超了就把"最早几轮"交给模型压成一条摘要，就地替换它们，
+# 只在"消息组"边界切（不会切开工具调用），压完接着聊不会失忆也不会 400。
+# 预算单位是 **token**（中文 1 字≈1 token，英文/日志约 3.2 字符≈1 token）。
+#   DeepSeek 的窗口是 1M 级，这 20 万只用了两成 —— 目的是"尽量少压缩、少失忆"。
+#   但要注意：每一轮都要把整个上下文发给模型，预算越大，越贵也越慢。
+#     想更少压缩：调到 500000（一次折叠会很大，摘要更粗；原文都在 archive 里）
+#     想省钱/更快：调到 80000
+#   context_budget = 0  -> 关闭压缩（退回"按条数裁剪"，会忘事）
+context_budget = 200000
+# 尾部保留多少个"消息组"原文（一组 = 一问 / 一答 / 一次工具调用+结果）
+context_keep_tail = 6
+# 开头除 system 外保留几组（首个任务，建议留着）
+context_keep_first = 1
+# 被折叠掉的原文要不要另存一份（sessions\xxx.archive.jsonl），agent 可 search_text 回捞
+context_archive = on
+# 归档超过多少 MB 就滚一份 .old（0 = 不限）
+context_archive_max_mb = 50
+# 摘要用哪个模型；留空 = 沿用主模型（想省钱可以填个便宜的小模型）
+summary_model =
+
+# ---- 危险操作确认（v1.9）----
+# on（默认）= auto_approve 打开时，遇到下面这些"命令位"的操作仍然问你一次 y/N：
+#     format / diskpart / bcdedit / vssadmin / wbadmin / shutdown
+#     del /s、rd /s、rmdir /s（递归删除）、del C:\* 这类盘符通配
+#     reg delete|add、cipher /w、takeown /f、taskkill /f /im、Remove-Item -Recurse
+#   往 C:\Windows、C:\Program Files、C:\ProgramData、\Startup\ 写文件，或写 .exe/.dll/.sys
+# 普通操作都不问：del 单个文件、del /q 文件、dir /s、写 .txt/.py/.json 等。
+# off = 完全按 auto_approve 来（不再额外确认，风险自负）
+confirm_dangerous = on
+
+# ---- 搜索（v1.8）----
+# search_text 最多跑多久（秒），0 = 不限。到点会带着"已搜到的结果"返回；
+# 期间也可以敲 /stop 中断（以前一句全盘搜索能锁死几分钟）
+search_timeout = 20
+
+# ---- 显示（v1.5）----
+# 运行中的实时状态行（一行原地刷新，看得出"在干活/卡住/在等你确认"）
+#   auto = 真终端才显示（输出重定向到文件时自动关，免得把控制字符写进文件）；on / off = 强制
+status_line = auto
+# 每轮回答结束后的分界线（好找"这次回答到哪儿为止"）
+#   line = ─────  /  ascii = =====  /  blank = 空一行  /  none = 不打
+separator = line
+
+# ---- 颜色（v1.5）----
+# auto（默认）= 真控制台里才上色：Win10+ 走 ANSI 码，老系统（Win7）自动改用
+#               SetConsoleTextAttribute 控制台属性接口；输出重定向到文件时自动关
+# on / vt / win32 = 强制开（vt=纯 ANSI，win32=控制台属性）；off = 完全不开
+color = auto
+# 各部分用哪个颜色。可选值：red green yellow blue magenta cyan white grey
+#   bright_red bright_green bright_yellow bright_blue bright_magenta bright_cyan
+#   bright_white none
+color_tool = bright_cyan        # 工具调用 ↳ / 正在执行 / 自动同意
+color_think = bright_magenta    # 思考内容提示
+color_warn = bright_yellow      # 中断、超时、需要你确认
+color_error = bright_red        # 出错
+color_dim = grey                # 提示、实时状态行、分界线
+color_user = bright_green       # 你> 提示符
+
+# ---- 环境档案（新环境自动识别，v1.5）----
+# auto（默认）= 换机器/换目录后第一次启动，自动探一遍这台机器：系统版本与位数、
+#               有哪些命令行工具、网络通不通、桌面/下载在哪、性能如何……
+#               结果写进 env-profile.txt，并把档案直接塞进系统提示词 —— 于是
+#               agent 一上来就知道这台机器的情况，不用你每次从头解释。
+#               指纹没变就直接读文件（几乎不花时间）；超过 14 天自动刷新一次。
+#               off = 关掉这个功能（不探测也不注入）
+env_profile = auto
+# 档案文件名（跟着文件夹走；想放别处就写绝对路径）。可以手动编辑，改了下次启动就生效
+env_profile_file = env-profile.txt
+# 注入方式：brief = 只塞几行摘要（默认，省 token）；full = 整段塞进提示词
+# 完整档案一直在 env-profile.txt 里，agent 需要细节时会自己 read_file 它
+env_profile_inject = brief
+
+# ---- 其它 ----
+tools = on
+# 一次提问里最多调用多少轮工具（v1.6 从 12 提到 60：长任务不用再手动改）
+max_rounds = 60
+max_tokens = 8000
+# 历史最多保留多少条消息（只在 context_budget = 0 时才生效；压缩开着时按 token 管）
+max_history = 60
+# workspace 留空 = 用包内 workspace 目录；也可写绝对路径，例如 D:\aicode
+# 说明：这只是"相对路径的起点"，agent 没有沙箱，绝对路径能动整机
+workspace =
+# 系统提示词文件（默认 prompt.txt；用记事本改那个文件就能改 agent 的行为）
+prompt_file = prompt.txt
+# search_text 默认跳过哪些目录（逗号分隔；留空 = 整机都搜）
+search_skip = py,sessions,__pycache__,.git,versions,tools
+# 追加到系统提示词后面（可选，例如：回答尽量简短）
+system_extra =
