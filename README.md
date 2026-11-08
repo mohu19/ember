@@ -90,4 +90,4 @@ py\python.exe program\tools\test_web.py     :: 22 项（网页 API、多会话�
 
 ## 许可证
 
-尚未指定。作者保留所有权利；如需开源协议请补充 `LICENSE`。
+MIT，见 [LICENSE](LICENSE)。
