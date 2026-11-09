@@ -248,6 +248,19 @@ def verify(out_path, py_exe):
             print("  [%s] 跑一次 run.cmd 后启动文件全部没变%s"
                   % ("PASS" if not bad else "FAIL", "" if not bad else "：" + "、".join(bad)))
             ok = ok and not bad
+            # v2.4：版本号必须一致 —— README 首行、agent.py 的 VERSION、包名
+            ver_txt = open(os.path.join(root, "program", "agent.py"),
+                           encoding="utf-8").read()
+            mo = re.search(r'^VERSION = "([\d.]+)"', ver_txt, re.M)
+            real_ver = mo.group(1) if mo else ""
+            first_line = open(os.path.join(root, "README-FIRST.txt"),
+                              encoding="utf-8-sig").readline().strip()
+            ver_ok = real_ver and ("v" + real_ver) in first_line
+            print("  [%s] README 首行版本与 agent.py 一致（%s）%s"
+                  % ("PASS" if ver_ok else "FAIL", real_ver,
+                     "" if ver_ok else " 首行：" + first_line[:40]))
+            ok = ok and ver_ok
+
             # v2.4：README 里提到的每个路径都必须在包里存在（防止文档漂移）
             rd = os.path.join(root, "README-FIRST.txt")
             rd_txt = open(rd, encoding="utf-8-sig", errors="replace").read()
