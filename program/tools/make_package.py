@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import zipfile
@@ -36,10 +37,11 @@ def _find_root(start):
 
 
 ROOT = _find_root(HERE)
-VERSION = "2.3.3"
+VERSION = "2.4.0"
 ROOT_IN_ZIP = "ember-v%s" % VERSION
 
 FILES = ["program/agent.py", "program/doctools.py", "program/webui.html", "program/prompt.txt",
+         "program/find_python.cmd",
          "run.cmd", "run.bat", "launch.vbs", "web.cmd", "start.cmd",
          "resume.cmd", "diagnose.cmd", "README-FIRST.txt"]
 DIRS = ["program/tools", "py", "py32", "ucrt"]   # py=64 位运行时，py32=32 位运行时（老机器用）
@@ -169,7 +171,7 @@ def verify(out_path, py_exe):
         ok = ok and not leaked
         # v1.6：备用入口必须一起进包，否则老机器打不开就真没辙了
         want = ("program/agent.py", "program/doctools.py", "program/prompt.txt",
-                "program/webui.html", "program/tools/selftest.py",
+                "program/webui.html", "program/tools/selftest.py", "program/find_python.cmd",
                 "config.txt", "README-FIRST.txt", "run.cmd", "run.bat", "launch.vbs",
                 "web.cmd", "start.cmd", "resume.cmd", "diagnose.cmd",
                 "py/python.exe", "py32/python.exe",
@@ -246,6 +248,49 @@ def verify(out_path, py_exe):
             print("  [%s] 跑一次 run.cmd 后启动文件全部没变%s"
                   % ("PASS" if not bad else "FAIL", "" if not bad else "：" + "、".join(bad)))
             ok = ok and not bad
+            # v2.4：README 里提到的每个路径都必须在包里存在（防止文档漂移）
+            rd = os.path.join(root, "README-FIRST.txt")
+            rd_txt = open(rd, encoding="utf-8-sig", errors="replace").read()
+            tokens = set(re.findall(r"(?:program|py32?|ucrt)\\[\w\\.]+|[\w-]+\.cmd", rd_txt))
+            missing_doc = [t for t in sorted(tokens)
+                           if not os.path.exists(os.path.join(root, t.replace("\\", os.sep)))]
+            print("  [%s] README 里提到的路径都存在（%d 个）%s"
+                  % ("PASS" if not missing_doc else "FAIL", len(tokens),
+                     "" if not missing_doc else " 缺：" + "、".join(missing_doc)))
+            ok = ok and not missing_doc
+
+            # v2.4：web.cmd 冒烟 —— 能起服务、能打出访问地址，然后杀掉整棵进程树
+            web_proc = None
+            try:
+                web_proc = subprocess.Popen(
+                    ["cmd", "/c", "web.cmd", "8899"], cwd=root,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                lines = []
+
+                def _reader(proc, box):
+                    try:
+                        for ln in proc.stdout:
+                            box.append(ln)
+                            if b"127.0.0.1:" in ln and b"t=" in ln:
+                                return
+                    except Exception:
+                        pass
+
+                th = threading.Thread(target=_reader, args=(web_proc, lines), daemon=True)
+                th.start()
+                th.join(30)
+                got_url = any(b"127.0.0.1:" in ln and b"t=" in ln for ln in lines)
+                print("  [%s] web.cmd 能启动并打出访问地址" % ("PASS" if got_url else "FAIL"))
+                ok = ok and got_url
+            except Exception as exc:                  # noqa: BLE001
+                print("  [FAIL] web.cmd 冒烟失败：%s" % exc)
+                ok = False
+            finally:
+                if web_proc is not None:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(web_proc.pid)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             # diagnose.cmd 必须真的跑到底（以前块里 echo 1) 会提前闭合，整段被跳过）
             dg = subprocess.run(["cmd", "/c", "diagnose.cmd < nul"], cwd=root, timeout=180,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

@@ -41,6 +41,32 @@ NS_R = "{%s}" % R
 # --------------------------------------------------------------------------- #
 # 共用小工具
 # --------------------------------------------------------------------------- #
+MAX_PART_BYTES = 64 * 1024 * 1024      # 单个部件解压后上限
+MAX_TOTAL_BYTES = 160 * 1024 * 1024   # 整个文档解压后上限
+MAX_PDF_BYTES = 80 * 1024 * 1024
+
+
+def _zip_guard(zf):
+    """挡住解压炸弹：单个部件/总量都有上限（审计报告 P1-C4）。"""
+    total = 0
+    for info in zf.infolist():
+        if info.file_size > MAX_PART_BYTES:
+            raise ValueError("文档里有部件解压后超过 %d MB，不处理（可能是压缩炸弹）"
+                             % (MAX_PART_BYTES // 1048576))
+        total += info.file_size
+    if total > MAX_TOTAL_BYTES:
+        raise ValueError("文档解压后总共超过 %d MB，不处理"
+                         % (MAX_TOTAL_BYTES // 1048576))
+
+
+def _xml_guard(blob, name="XML"):
+    """拒绝带 DTD/实体声明的部件（XXE / 实体膨胀）。"""
+    head = blob[:4096].lower()
+    if b"<!doctype" in head or b"<!entity" in head:
+        raise ValueError("%s 里带 DTD/实体声明，出于安全不解析这个文档" % name)
+    return blob
+
+
 def _read(path):
     with open(path, "rb") as fh:
         return fh.read()
@@ -124,9 +150,10 @@ def read_docx(path):
     data = _read(path)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         names = zf.namelist()
+        _zip_guard(zf)
         if "word/document.xml" not in names:
             raise ValueError("不像 .docx（缺 word/document.xml）；如果是 .doc 请先转格式")
-        root = ET.fromstring(zf.read("word/document.xml"))
+        root = ET.fromstring(_xml_guard(zf.read("word/document.xml"), "word/document.xml"))
     body = root.find(NS_W + "body")
     if body is None:
         return ""
@@ -233,6 +260,7 @@ def read_xlsx(path):
     data = _read(path)
     ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        _zip_guard(zf)
         shared = _xlsx_strings(zf)
         chunks = []
         for name, target in _xlsx_sheets(zf):
@@ -265,6 +293,7 @@ def read_xlsx(path):
 def read_pptx(path):
     data = _read(path)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        _zip_guard(zf)
         slides = sorted([n for n in zf.namelist()
                          if re.match(r"^ppt/slides/slide\d+\.xml$", n)],
                         key=lambda n: int(re.findall(r"\d+", n)[-1]))
@@ -604,6 +633,9 @@ def read_pdf(path, pages=None, max_chars=80000):
     data = _read(path)
     if not data.startswith(b"%PDF"):
         raise ValueError("不像 PDF（开头不是 %%PDF）")
+    if len(data) > MAX_PDF_BYTES:
+        raise ValueError("这个 PDF 有 %.0f MB，超过 %d MB 上限，先拆分再读"
+                         % (len(data) / 1048576.0, MAX_PDF_BYTES // 1048576))
     objs = _pdf_objects(data)
     for num, body in _pdf_objstm_objects(objs).items():
         objs.setdefault(num, body)

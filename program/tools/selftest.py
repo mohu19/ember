@@ -62,9 +62,17 @@ import agent  # noqa: E402  （只用来复用 sanity_check_history / load_sessi
 # --------------------------------------------------------------------------- #
 # 假模型服务器
 # --------------------------------------------------------------------------- #
+class _QuietServer(ThreadingHTTPServer):
+    """客户端半路断开时不要打 traceback（测试输出里看着像失败）。"""
+
+    def handle_error(self, request, client_address):
+        pass
+
+
 class FakeModel(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     last_system = [""]
+    last_error = [""]         # 结构非法时记一句，测试里断言用
     retry_left = [0]          # v1.8：先故意返回 503 几次，测自动重试
 
     def log_message(self, *args):
@@ -102,6 +110,40 @@ class FakeModel(BaseHTTPRequestHandler):
         self._chunk({}, "tool_calls")
         self._done()
 
+    @staticmethod
+    def _struct_error(msgs):
+        """模拟真实 API 的严格性：tool_calls 必须紧跟着回账，否则 400。"""
+        pending = []
+        for m in msgs:
+            role = m.get("role")
+            if role == "assistant":
+                if pending:
+                    return "tool_calls not answered: %s" % ",".join(pending)
+                pending = [c.get("id") for c in (m.get("tool_calls") or []) if c.get("id")]
+            elif role == "tool":
+                cid = m.get("tool_call_id")
+                if cid not in pending:
+                    return "unexpected tool message: %s" % cid
+                pending.remove(cid)
+            elif role == "user":
+                if pending:
+                    return "tool_calls not answered before user: %s" % ",".join(pending)
+        if pending:
+            return "tool_calls not answered at end: %s" % ",".join(pending)
+        return ""
+
+    def _bad_request(self, why):
+        payload = {"error": {"message": "Bad messages: " + why, "type": "invalid_request_error"}}
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except Exception:
+            pass
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         try:
@@ -109,6 +151,11 @@ class FakeModel(BaseHTTPRequestHandler):
         except Exception:
             body = {}
         msgs = body.get("messages") or []
+        struct_err = FakeModel._struct_error(msgs)
+        if struct_err:
+            FakeModel.last_error[0] = struct_err
+            self._bad_request(struct_err)
+            return
         for m in msgs:
             # 摘要/标题请求的 system 是模板，不算"这台机器的环境"，别覆盖掉
             if (m.get("role") == "system"
@@ -228,7 +275,7 @@ class FakeModel(BaseHTTPRequestHandler):
 
 
 def start_server():
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeModel)
+    srv = _QuietServer(("127.0.0.1", 0), FakeModel)
     srv.daemon_threads = True
     t = threading.Thread(target=srv.serve_forever)
     t.daemon = True
@@ -800,7 +847,9 @@ def main():
                             "function": {"name": "run_cmd", "arguments": "{}"}}]}]
     n13 = agent.repair_history(h13)
     ok, why = agent.sanity_check_history(h13)
-    check("孤立 tool_call -> 补一条 tool 结果", n13 == 1 and ok, why)
+    # v2.3.4：除了补 tool 回账，还会在最前面补一条 user（保证第一条非 system 是 user），
+    # 所以这里是 >=1 而不是 ==1
+    check("孤立 tool_call -> 补 tool 回账且结构合法", n13 >= 1 and ok, "%d %s" % (n13, why))
 
     # ---- 13) v1.7 上下文压缩 ----
     print("[13] 上下文压缩：折叠成摘要 / 不切开工具组 / 落盘可重载")
@@ -1307,6 +1356,148 @@ def main():
             b"trailer<</Root 1 0 R>>\n%%EOF\n"]))
     got_img = _dt.read_pdf(pdf_img)
     check("没有文字层时明确说明", "没有文字层" in got_img, got_img[:40].replace("\n", " "))
+
+    # ---- 22) v2.3.4：坏会话（tool_calls 没回账）必须能修好并正常继续 ----
+    print("[22] v2.3.4：坏会话修复（tool_calls 缺回账 / 孤儿 tool / 坏 id）")
+    import io as _io22
+    broken_cases = {
+        "缺一个tool": [
+            {"role": "user", "content": "看看桌面"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "list_dir", "arguments": "{}"}}]},
+            {"role": "user", "content": "还在吗"},
+        ],
+        "两个只回一个": [
+            {"role": "user", "content": "做两件事"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "list_dir", "arguments": "{}"}},
+                            {"id": "c2", "type": "function",
+                             "function": {"name": "list_dir", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "结果1"},
+            {"role": "user", "content": "继续"},
+        ],
+        "孤儿tool": [
+            {"role": "user", "content": "嗨"},
+            {"role": "tool", "tool_call_id": "ghost", "content": "x"},
+        ],
+        "坏id": [
+            {"role": "user", "content": "嗨"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"type": "function",
+                             "function": {"name": "x", "arguments": "{}"}}]},
+        ],
+    }
+    for name, msgs in broken_cases.items():
+        p22 = os.path.join(tmp, "broken-%s.jsonl" % name)
+        with _io22.open(p22, "w", encoding="utf-8") as fh:
+            for m in msgs:
+                fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+        hist22 = agent.ensure_system(agent.load_session(p22))
+        fixed22 = agent.repair_history(hist22)
+        ok22, why22 = agent.sanity_check_history(hist22)
+        err22 = FakeModel._struct_error(hist22)
+        check("坏会话能修好：%s" % name, fixed22 > 0 and ok22 and not err22,
+              "修复%d 自检%s 契约%s" % (fixed22, "OK" if ok22 else why22, err22 or "OK"))
+
+    # 真的用 --resume 跑一次：坏会话必须能继续聊，而不是每次 400
+    resume_case = os.path.join(tmp, "resume-broken.jsonl")
+    with _io22.open(resume_case, "w", encoding="utf-8") as fh:
+        for m in broken_cases["缺一个tool"]:
+            fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+    before_size = os.path.getsize(resume_case)
+    cfg22 = write_config(tmp, api_base, "resume-broken", api_timeout=30, turn_timeout=60)
+    FakeModel.last_error[0] = ""
+    env22 = dict(os.environ)
+    env22.pop("DEEPSEEK_API_KEY", None)
+    env22["PYTHONIOENCODING"] = "utf-8"
+    proc22 = subprocess.Popen([PY, AGENT, "--config", cfg22, "--resume", resume_case],
+                              cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, env=env22)
+    rc22 = 0
+    try:
+        out22 = proc22.communicate(input="继续\n/exit\n".encode("utf-8"), timeout=90)[0] \
+            .decode("utf-8", "replace")
+        rc22 = proc22.returncode
+    except subprocess.TimeoutExpired:
+        agent.kill_tree(proc22)
+        out22, rc22 = "", -1
+    check("坏会话 --resume 不会 400", "400" not in out22 and not FakeModel.last_error[0],
+          (FakeModel.last_error[0] or out22[-80:]).replace("\n", " "))
+    check("坏会话续聊能正常走完", rc22 == 0 and "你>" in out22,
+          "rc=%s 输出尾部=%s" % (rc22, out22.strip().replace("\n", " ")[-70:]))
+    after = open(resume_case, encoding="utf-8").read()
+    check("修复结果写回了文件", "ghost" not in after and len(after) >= before_size,
+          "%d -> %d 字节" % (before_size, len(after)))
+
+    # ---- 23) v2.3.6：退出留面包屑（闪退排查用）----
+    print("[23] v2.3.6：退出记录 logs/run-*.log")
+    import glob as _g23
+    log_dir = os.path.join(ROOT, "logs")
+    before_logs = set(_g23.glob(os.path.join(log_dir, "run-*.log")))
+    cfg23 = write_config(tmp, api_base, "exitlog", api_timeout=30, turn_timeout=60)
+    run_agent(tmp, cfg23, "SCN:runcmd|echo bye", 40, stdin_data="/exit\n")
+    after_logs = set(_g23.glob(os.path.join(log_dir, "run-*.log")))
+    check("退出后生成了 run 日志", bool(after_logs), str(len(after_logs)))
+    last_line = ""
+    if after_logs:
+        newest = max(after_logs, key=os.path.getmtime)
+        lines = [l for l in open(newest, encoding="utf-8", errors="replace").read().splitlines()
+                 if l.strip()]
+        last_line = lines[-1] if lines else ""
+    check("面包屑里有 退出码/原因/内存",
+          "退出码=" in last_line and "原因=" in last_line and "内存=" in last_line,
+          last_line[:100])
+
+    # ---- 24) v2.4：启动器兜底 + 文档安全防护 ----
+    print("[24] v2.4：find_python 兜底 / DTD 防护")
+    tmp_py = tempfile.mkdtemp(prefix="ember-findpy-")
+    os.makedirs(os.path.join(tmp_py, "program"))
+    shutil.copy(os.path.join(ROOT, "program", "find_python.cmd"),
+                os.path.join(tmp_py, "program", "find_python.cmd"))
+    runner = os.path.join(tmp_py, "t.cmd")
+    with io.open(runner, "w", encoding="ascii", newline="\r\n") as fh:
+        fh.write('@echo off\r\n')
+        fh.write('call "%~dp0program\\find_python.cmd"\r\n')
+        fh.write('echo RC=%ERRORLEVEL%\r\n')
+        fh.write('echo PICK=%PYEXE% %PYARG%\r\n')
+    try:
+        out_fp = subprocess.run(["cmd", "/c", runner], cwd=tmp_py, timeout=60,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        txt_fp = out_fp.stdout.decode("gbk", "replace")
+    except Exception as exc:                       # noqa: BLE001
+        txt_fp = "EXC:%s" % exc
+    has_sys_py = bool(shutil.which("python") or shutil.which("py"))
+    if has_sys_py:
+        pick = ""
+        for line in txt_fp.splitlines():
+            if line.startswith("PICK="):
+                pick = line[5:].strip()
+        check("包里没有运行时时会退到系统 Python",
+              "RC=0" in txt_fp and bool(pick),
+              "选中=[%s] 输出=%s" % (pick, txt_fp.strip().replace("\n", " ")[:60]))
+    else:
+        check("包里没有运行时时会明确报错", "RC=1" in txt_fp,
+              txt_fp.strip().replace("\n", " ")[:70])
+    shutil.rmtree(tmp_py, ignore_errors=True)
+
+    import zipfile as _zf24
+    evil = os.path.join(tmp, "evil.docx")
+    with _zf24.ZipFile(evil, "w") as z24:
+        z24.writestr("word/document.xml",
+                     '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]>'
+                     '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                     'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>&a;</w:t>'
+                     '</w:r></w:p></w:body></w:document>')
+    try:
+        _dt.read_docx(evil)
+        check("带 DTD/实体的文档会被拒绝", False)
+    except Exception as exc:                       # noqa: BLE001
+        check("带 DTD/实体的文档会被拒绝", "DTD" in str(exc) or "实体" in str(exc), str(exc)[:50])
+    normal = os.path.join(tmp, "normal.docx")
+    _dt.write_docx(normal, "# 正常的\n\n正文\n")
+    check("正常文档不受影响", "# 正常的" in _dt.read_docx(normal))
 
     # ---- 收尾 ----
     srv.shutdown()

@@ -7,35 +7,26 @@ pushd "%HERE%" >nul 2>&1
 if errorlevel 1 cd /d "%HERE%"
 
 rem ---------- 自动挑对位数的 Python（32 位系统用 py32，64 位用 py）----------
-set "PYEXE=%HERE%py\python.exe"
-if /i "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 set "PYEXE=%HERE%py32\python.exe"
-if not exist "%PYEXE%" (
-  echo.
-  echo   [X] 找不到能用的 Python 运行时: %PYEXE%
-  echo       64 位系统用 py\python.exe，32 位系统用 py32\python.exe
-  echo       这个包可能解压不完整；也可以手动补上缺的那个 py\ / py32\ 文件夹
-  echo.
-  pause
-  exit /b 1
-)
+call "%HERE%program\find_python.cmd"
+if errorlevel 1 goto :nopy
 :menu
 cls
 echo ==================================================
 echo    ember  ^|  选择要继续的历史对话
 echo ==================================================
 echo.
-"%PYEXE%" -c "pass" >nul 2>&1
+%PYEXE% %PYARG% -c "pass" >nul 2>&1
 if not "%ERRORLEVEL%"=="0" (
   if exist "%HERE%ucrt\x64" if exist "%HERE%py" copy /y "%HERE%ucrt\x64\*.dll" "%HERE%py\" >nul 2>&1
   if exist "%HERE%ucrt\x86" if exist "%HERE%py32" copy /y "%HERE%ucrt\x86\*.dll" "%HERE%py32\" >nul 2>&1
-  "%PYEXE%" -c "pass" >nul 2>&1
+  %PYEXE% %PYARG% -c "pass" >nul 2>&1
 )
 if not "%ERRORLEVEL%"=="0" (
   echo   [X] Python 起不来，多半是 Win7 缺 UCRT，详见 diagnose.cmd
   pause
   exit /b 1
 )
-"%PYEXE%" "%HERE%program\agent.py" --list-sessions
+%PYEXE% %PYARG% "%HERE%program\agent.py" --list-sessions
 echo.
 set "N="
 set /p N=输入编号后回车（直接回车=退出）: 
@@ -47,7 +38,7 @@ findstr /r /c:"^[0-9][0-9]*$" "%CHK%" >nul
 set "CHKRC=%ERRORLEVEL%"
 del "%CHK%" >nul 2>&1
 if not "%CHKRC%"=="0" goto :badnum
-"%PYEXE%" "%HERE%program\agent.py" --resume !N!
+%PYEXE% %PYARG% "%HERE%program\agent.py" --resume !N!
 echo.
 echo   —— 本次会话已结束 ——
 set "AGAIN="
@@ -62,3 +53,13 @@ echo.
 echo   只能输数字编号（或直接回车退出），已返回列表。
 ping -n 2 127.0.0.1 >nul 2>nul
 goto :menu
+
+:nopy
+echo.
+echo   [X] 找不到能用的 Python。
+echo       找过：本目录 py\python.exe、py32\python.exe，以及系统里的 py -3 / python
+echo       常见原因：只拷了 .cmd，没把整个文件夹（含 py\ 和 py32\）一起拷；
+echo                 或者压缩包解压不完整。
+echo.
+pause
+exit /b 1

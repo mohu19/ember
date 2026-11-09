@@ -6,8 +6,6 @@ set "HERE=%~dp0"
 pushd "%HERE%" >nul 2>&1
 if errorlevel 1 cd /d "%HERE%"
 set "AGENT=%HERE%program\agent.py"
-set "PYEXE=%HERE%py\python.exe"
-if /i "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 set "PYEXE=%HERE%py32\python.exe"
 
 echo ==========================================================
 echo    ember 诊断
@@ -20,7 +18,6 @@ echo         缺失！包不完整
 goto :noagent
 :agent_ok
 echo         存在
-
 :noagent
 echo  [配置] %HERE%config.txt
 if exist "%HERE%config.txt" goto :cfg_ok
@@ -29,48 +26,50 @@ goto :cfg_done
 :cfg_ok
 echo         存在
 :cfg_done
-
-echo  [运行时] %PYEXE%
-if exist "%PYEXE%" goto :py_ok
-echo         缺失！
-goto :nopy
-:py_ok
-echo         存在
-
+echo  [位数] %PROCESSOR_ARCHITECTURE%
+echo  [包里] py\ ：
+if exist "%HERE%py\python.exe" echo         有
+if not exist "%HERE%py\python.exe" echo         没有
+echo         py32\ ：
+if exist "%HERE%py32\python.exe" echo         有
+if not exist "%HERE%py32\python.exe" echo         没有
 echo.
-echo  [1] Python 能不能起来
-"%PYEXE%" -V
+echo  [1] 选一个能用的 Python
+call "%HERE%program\find_python.cmd"
+if errorlevel 1 goto :nopy
+echo      选中的: %PYEXE% %PYARG%
+%PYEXE% %PYARG% -V
 if not "%ERRORLEVEL%"=="0" goto :badpy
-
 echo.
 echo  [2] 系统信息
-echo      %PROCESSOR_ARCHITECTURE%
 ver
 echo.
 echo  [3] 完整体检（配置 / 网络 / 模型 / 流式）
 echo.
-"%PYEXE%" "%AGENT%" --doctor
+%PYEXE% %PYARG% "%AGENT%" --doctor
 echo.
 echo  —— 诊断结束 ——
+echo  如果上面有红字，把整屏抄下来；logs\ 里的 run-*.log 也有记录。
 pause
 endlocal
 exit /b 0
 
-:badpy
+:nopy
 echo.
-echo      [X] Python 起不来，多半是 Win7 缺 UCRT。三种办法，任选一种：
-echo          1. 包里有 ucrt 目录的话，重新双击 run.cmd 会自动补
-echo          2. 装一次 vc_redist，64 位就装 x64，装完重启
-echo          3. Win7 SP1 还要 KB2533623
+echo      [X] 找不到能用的 Python
+echo          找过：本目录 py\python.exe、py32\python.exe，以及系统里的 py -3 / python
+echo          常见原因：只拷了 .cmd 没拷 py\ 和 py32\；或者压缩包解压不完整
 echo.
 pause
 endlocal
 exit /b 1
 
-:nopy
+:badpy
 echo.
-echo      [X] 找不到 Python 运行时 %PYEXE%
-echo          64 位系统用 py\python.exe，32 位系统用 py32\python.exe
+echo      [X] 选中的 Python 起不来，多半是 Win7 缺 UCRT
+echo          1. 包里带 ucrt\ 的话，重新双击 run.cmd 会自动补
+echo          2. 装一次 vc_redist（64 位装 x64），装完重启
+echo          3. Win7 SP1 还要 KB2533623
 echo.
 pause
 endlocal

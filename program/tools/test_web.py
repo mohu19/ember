@@ -180,6 +180,54 @@ def main():
         it = item_of(sa)
         check("点开 A 之后绿点消失", bool(it) and it[0]["unread"] is False, str(it))
 
+        # ---- v2.3.5：后填 key 不用重启，点刷新/发消息时自动重读 ----
+        cfg_path = cfg
+        raw_cfg = open(cfg_path, encoding="utf-8-sig").read()
+        no_key_cfg = "\n".join(("api_key =" if l.strip().lower().startswith("api_key") else l)
+                               for l in raw_cfg.splitlines()) + "\n"
+        open(cfg_path, "w", encoding="utf-8-sig", newline="\n").write(no_key_cfg)
+        code, st1 = req("/api/state")
+        check("没 key 时 /api/state 会说自己没 key", st1.get("has_key") is False, str(st1.get("has_key")))
+        code, chat1 = req("/api/chat", "POST", {"text": "在吗"})
+        check("没 key 时发消息返回 need_key", code == 400 and chat1.get("need_key") is True,
+              "%s %s" % (code, chat1))
+        # 把 key 写回去 -> 刷新 -> 应该立刻能用
+        open(cfg_path, "w", encoding="utf-8-sig", newline="\n").write(raw_cfg)
+        code, rl = req("/api/reload", "POST", {})
+        check("刷新后能读到 key", code == 200 and rl.get("has_key") is True, str(rl))
+        code, chat2 = req("/api/chat", "POST", {"text": "SCN:runcmd|echo key-ok"})
+        check("刷新后不用重启就能发", code == 200 and chat2.get("ok"), str(chat2))
+
+        # ---- v2.3.4：坏会话（tool_calls 没回账）在网页里必须能打开并继续 ----
+        sess_dir = os.environ.get("EMBER_SESSIONS") or ""
+        bp = os.path.join(sess_dir, "broken-web.jsonl")
+        with open(bp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"role": "user", "content": "看看桌面"}, ensure_ascii=False) + "\n")
+            fh.write(json.dumps({"role": "assistant", "content": None,
+                                 "tool_calls": [{"id": "x1", "type": "function",
+                                                 "function": {"name": "list_dir",
+                                                              "arguments": "{}"}}]},
+                                ensure_ascii=False) + "\n")
+            fh.write(json.dumps({"role": "user", "content": "还在吗"}, ensure_ascii=False) + "\n")
+        code, op = req("/api/open?name=broken-web.jsonl")
+        check("坏会话能打开（不再每次 400）", code == 200 and op.get("ok"), str(code))
+        code, sent = req("/api/chat", "POST", {"text": "继续", "session": "broken-web.jsonl"})
+        check("坏会话能继续发消息", code == 200 and sent.get("ok"), str(sent))
+        kinds_b, since_b, dl_b = [], 0, time.time() + 40
+        while time.time() < dl_b:
+            _, evs = req("/api/events?since=%d&session=broken-web.jsonl" % since_b)
+            for e in evs:
+                kinds_b.append(e.get("kind"))
+                since_b = max(since_b, e["seq"])
+            if "turn_end" in kinds_b or "error" in kinds_b:
+                break
+            time.sleep(0.25)
+        check("坏会话这一轮没有报错", "error" not in kinds_b and "turn_end" in kinds_b, str(kinds_b))
+        with open(bp, encoding="utf-8") as fh:
+            fixed_text = fh.read()
+        check("坏会话被修好并写回文件", '"tool_call_id": "x1"' in fixed_text,
+              fixed_text.count("\n") and "行数=%d" % fixed_text.count("\n"))
+
         # 改名 / 删除（新会话要先说一句才会落盘）
         code, made2 = req("/api/new", "POST", {})
         nm = made2.get("session")

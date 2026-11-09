@@ -8,6 +8,8 @@ python38.zip
 sessions/
 workspace/
 env-profile.txt
+logs/
+crash-*.log
 key.txt
 
 # 构建产物

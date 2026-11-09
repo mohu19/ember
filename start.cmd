@@ -7,16 +7,15 @@ pushd "%HERE%" >nul 2>&1
 if errorlevel 1 cd /d "%HERE%"
 
 set "AGENT=%HERE%program\agent.py"
-set "PYEXE=%HERE%py\python.exe"
-if /i "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 set "PYEXE=%HERE%py32\python.exe"
+call "%HERE%program\find_python.cmd"
+if errorlevel 1 goto :nopy
 
 if not exist "%AGENT%" goto :nofile
-if not exist "%PYEXE%" goto :nopy
 
-"%PYEXE%" -c "pass" >nul 2>&1
+%PYEXE% %PYARG% -c "pass" >nul 2>&1
 if not "%ERRORLEVEL%"=="0" (
   if exist "%HERE%ucrt" call :install_ucrt
-  "%PYEXE%" -c "pass" >nul 2>&1
+  %PYEXE% %PYARG% -c "pass" >nul 2>&1
 )
 if not "%ERRORLEVEL%"=="0" goto :badpy
 
@@ -48,14 +47,14 @@ goto :menu
 
 :doctor
 echo.
-"%PYEXE%" "%AGENT%" --doctor
+%PYEXE% %PYARG% "%AGENT%" --doctor
 echo.
 pause
 goto :menu
 
 :web
 echo.
-"%PYEXE%" "%AGENT%" --check-key >nul 2>&1
+%PYEXE% %PYARG% "%AGENT%" --check-key >nul 2>&1
 if not "%ERRORLEVEL%"=="0" (
   echo   还没有可用的 API Key。
   echo   先选 4（命令行）跑一次，它会让你填 key，然后回来开网页。
@@ -63,7 +62,7 @@ if not "%ERRORLEVEL%"=="0" (
   pause
   goto :menu
 )
-start "ember web" cmd /k ""%PYEXE%" "%AGENT%" --web"
+start "ember web" cmd /k %PYEXE% %PYARG% "%AGENT%" --web
 echo   网页终端已在另一个窗口启动，浏览器会自动打开。
 echo   关掉那个控制台窗口 = 停止服务。
 echo.
@@ -72,14 +71,14 @@ goto :menu
 
 :cmdnew
 echo.
-start "ember" cmd /k ""%PYEXE%" "%AGENT%" --bootstrap"
+start "ember" cmd /k %PYEXE% %PYARG% "%AGENT%" --bootstrap
 echo   已经在新窗口里打开命令行版。
 echo.
 goto :menu
 
 :cmdsame
 echo.
-"%PYEXE%" "%AGENT%" --bootstrap
+%PYEXE% %PYARG% "%AGENT%" --bootstrap
 echo.
 echo   —— 命令行会话已结束 ——
 pause
@@ -87,7 +86,7 @@ goto :menu
 
 :cfg
 echo.
-"%PYEXE%" "%AGENT%" --show-config
+%PYEXE% %PYARG% "%AGENT%" --show-config
 echo.
 pause
 goto :menu
@@ -111,20 +110,30 @@ exit /b 1
 
 :nopy
 echo.
-echo   [X] 找不到 Python 运行时: %PYEXE%
-echo       64 位系统用 py\python.exe，32 位系统用 py32\python.exe
+echo   [X] 找不到能用的 Python。
+echo       找过这些地方：
+echo         - 本目录 py\python.exe     %HERE%py\python.exe
+echo         - 本目录 py32\python.exe   %HERE%py32\python.exe
+echo         - 系统里已装的 py -3 / python
+echo.
+echo       常见原因只有两个：
+echo         1) 只拷了 .cmd，没有把整个文件夹（含 py\ 和 py32\）一起拷
+echo         2) 压缩包解压不完整
+echo       解决：重新解压完整包；或者在一台有 Python 3.8+ 的机器上装好再拷过来。
 echo.
 pause
 exit /b 1
-
 :badpy
 echo.
-echo   [X] 包里的 Python 起不来，多半是 Win7 缺 UCRT。
-echo       双击 diagnose.cmd 看详细原因，或按 README 的"缺 UCRT 怎么办"处理。
+echo   [X] 包里的 Python 起不来: %PYEXE% %PYARG%
+echo       最常见原因：Windows 7 缺"通用 C 运行库"（UCRT）。
+echo         1) 包里带 ucrt\ 的话，重新双击一次会自动补（本脚本已试过一次）
+echo         2) 以管理员身份装 vc_redist：64 位装 x64，32 位装 x86，装完重启
+echo         3) Win7 SP1 还要 KB2533623
+echo       详见 README-FIRST.txt 的"缺 UCRT 怎么办"
 echo.
 pause
 exit /b 1
-
 :end
 endlocal
 exit /b 0

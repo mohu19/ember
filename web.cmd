@@ -9,23 +9,22 @@ if errorlevel 1 cd /d "%HERE%"
 if not exist "%HERE%program\agent.py" goto :nofile
 if not exist "%HERE%program\webui.html" goto :noweb
 
-set "PYEXE=%HERE%py\python.exe"
-if /i "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 set "PYEXE=%HERE%py32\python.exe"
-if not exist "%PYEXE%" goto :nopy
+call "%HERE%program\find_python.cmd"
+if errorlevel 1 goto :nopy
 
-"%PYEXE%" -c "pass" >nul 2>&1
+%PYEXE% %PYARG% -c "pass" >nul 2>&1
 if not "%ERRORLEVEL%"=="0" (
   rem v2.3.1：起不来先补 UCRT（按位数拷，别把 x64 拷进 py32）
   if exist "%HERE%ucrt\x64" if exist "%HERE%py" copy /y "%HERE%ucrt\x64\*.dll" "%HERE%py\" >nul 2>&1
   if exist "%HERE%ucrt\x86" if exist "%HERE%py32" copy /y "%HERE%ucrt\x86\*.dll" "%HERE%py32\" >nul 2>&1
-  "%PYEXE%" -c "pass" >nul 2>&1
+  %PYEXE% %PYARG% -c "pass" >nul 2>&1
 )
 if not "%ERRORLEVEL%"=="0" goto :badpy
 
 echo   启动网页终端（浏览器会自动打开；没有就手动访问下面那个地址）
 echo   关掉这个窗口或按 Ctrl+C 就结束服务
 echo.
-"%PYEXE%" "%HERE%program\agent.py" --web %*
+%PYEXE% %PYARG% "%HERE%program\agent.py" --web %*
 echo.
 echo   网页终端已停止。
 pause
@@ -46,12 +45,28 @@ pause
 exit /b 1
 
 :nopy
-echo   [X] 找不到 Python 运行时: %PYEXE%
+echo.
+echo   [X] 找不到能用的 Python。
+echo       找过这些地方：
+echo         - 本目录 py\python.exe     %HERE%py\python.exe
+echo         - 本目录 py32\python.exe   %HERE%py32\python.exe
+echo         - 系统里已装的 py -3 / python
+echo.
+echo       常见原因只有两个：
+echo         1) 只拷了 .cmd，没有把整个文件夹（含 py\ 和 py32\）一起拷
+echo         2) 压缩包解压不完整
+echo       解决：重新解压完整包；或者在一台有 Python 3.8+ 的机器上装好再拷过来。
+echo.
 pause
 exit /b 1
-
 :badpy
-echo   [X] 包里的 Python 启动失败，多半是 Win7 缺 UCRT。
-echo       先双击 diagnose.cmd 看看，或看 README 的"缺 UCRT 怎么办"。
+echo.
+echo   [X] 包里的 Python 起不来: %PYEXE% %PYARG%
+echo       最常见原因：Windows 7 缺"通用 C 运行库"（UCRT）。
+echo         1) 包里带 ucrt\ 的话，重新双击一次会自动补（本脚本已试过一次）
+echo         2) 以管理员身份装 vc_redist：64 位装 x64，32 位装 x86，装完重启
+echo         3) Win7 SP1 还要 KB2533623
+echo       详见 README-FIRST.txt 的"缺 UCRT 怎么办"
+echo.
 pause
 exit /b 1

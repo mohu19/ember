@@ -11,15 +11,14 @@ if not exist "%HERE%program\agent.py" goto :nofile
 if not exist "%HERE%config.txt" goto :noconfig
 
 rem ---------- 1) 自动挑对位数的 Python（32 位系统用 py32，64 位用 py）----------
-set "PYEXE=%HERE%py\python.exe"
-if /i "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 set "PYEXE=%HERE%py32\python.exe"
-if not exist "%PYEXE%" goto :nopy
+call "%HERE%program\find_python.cmd"
+if errorlevel 1 goto :nopy
 
 rem ---------- 2) Python 能不能起来；起不来且带了离线 UCRT 补丁就先装补丁再试 ----------
-"%PYEXE%" -c "pass" >nul 2>&1
+%PYEXE% %PYARG% -c "pass" >nul 2>&1
 if "%ERRORLEVEL%"=="0" goto :ready
 if exist "%HERE%ucrt" call :install_ucrt
-"%PYEXE%" -c "pass" >nul 2>&1
+%PYEXE% %PYARG% -c "pass" >nul 2>&1
 if not "%ERRORLEVEL%"=="0" goto :badpy
 
 :ready
@@ -28,7 +27,7 @@ echo   启动 ember（模型 / 目录以 config.txt 为准）
 echo   运行中敲 /stop 回车（或 ESC / Ctrl+C）可中断；/help 看命令，/exit 退出
 echo.
 set "PYTHONIOENCODING="
-"%PYEXE%" "%HERE%program\agent.py" --bootstrap %*
+%PYEXE% %PYARG% "%HERE%program\agent.py" --bootstrap %*
 set "RC=%ERRORLEVEL%"
 echo.
 if "%RC%"=="3" goto :nokey
@@ -77,23 +76,27 @@ exit /b 1
 
 :nopy
 echo.
-echo   [X] 找不到能用的 Python 运行时: %PYEXE%
-echo       64 位系统用 py\python.exe，32 位系统用 py32\python.exe
-echo       这个包可能解压不完整；也可以手动补上缺的那个 py\ / py32\ 文件夹
+echo   [X] 找不到能用的 Python。
+echo       找过这些地方：
+echo         - 本目录 py\python.exe     %HERE%py\python.exe
+echo         - 本目录 py32\python.exe   %HERE%py32\python.exe
+echo         - 系统里已装的 py -3 / python
+echo.
+echo       常见原因只有两个：
+echo         1) 只拷了 .cmd，没有把整个文件夹（含 py\ 和 py32\）一起拷
+echo         2) 压缩包解压不完整
+echo       解决：重新解压完整包；或者在一台有 Python 3.8+ 的机器上装好再拷过来。
 echo.
 pause
 exit /b 1
-
 :badpy
 echo.
-echo   [X] 包里的 Python 启动失败: %PYEXE%
+echo   [X] 包里的 Python 起不来: %PYEXE% %PYARG%
 echo       最常见原因：Windows 7 缺"通用 C 运行库"（UCRT）。
-echo.
-echo       三种办法，任选一种：
-echo         1) 如果包里有 ucrt\x64 或 ucrt\x86 目录，重新双击 run.cmd 会自动装
-echo         2) 以管理员身份装一次 vc_redist（64 位装 x64，32 位装 x86），装完重启
-echo         3) 在装好 UCRT 的机器上跑 tools\pack_ucrt.py 生成 ucrt\ 目录再拷过来
-echo       Win7 SP1 还需要 KB2533623；详见 README-FIRST.txt"缺 UCRT 怎么办"
+echo         1) 包里带 ucrt\ 的话，重新双击一次会自动补（本脚本已试过一次）
+echo         2) 以管理员身份装 vc_redist：64 位装 x64，32 位装 x86，装完重启
+echo         3) Win7 SP1 还要 KB2533623
+echo       详见 README-FIRST.txt 的"缺 UCRT 怎么办"
 echo.
 pause
 exit /b 1

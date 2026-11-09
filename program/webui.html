@@ -65,11 +65,13 @@
   #title { color: #dfe6f2; font-weight: 600; }
   #meta { color: #6b7484; margin-right: 8px; }
   #build { color: #3f4756; font-size: 11px; margin-right: 8px; }
-  #plainBtn {
+  #reloadBtn, #plainBtn {
     padding: 2px 8px; cursor: pointer; font-size: 11px; background: #1a1f2b; color: #8b93a3;
     border: 1px solid #262b36; border-radius: 4px;
   }
   #plainBtn.on { background: #24314a; color: #cfe0ff; border-color: #3a4a6b; }
+  #reloadBtn { margin-left: 8px; }
+  #reloadBtn.on { background: #24314a; color: #cfe0ff; border-color: #3a4a6b; }
 
   #log { flex: 1; overflow-y: auto; padding: 16px 20px 8px; }
 
@@ -176,6 +178,7 @@
       <span>
         <span id="build">界面 __BUILD__</span>
         <span id="meta"></span>
+        <button id="reloadBtn" title="重新读取 config.txt（后填的 API Key 不用重启 web.cmd）">刷新</button>
         <button id="plainBtn" title="只显示正文，隐藏“谁说的”和复制按钮">简洁</button>
       </span>
     </header>
@@ -228,6 +231,7 @@
   var generation = 0;        // 切会话时作废在途请求
   var seqMap = {};           // 每个会话已收到的事件序号
   var lastSessions = [];     // 最近一次拿到的会话列表
+  var hasKey = null;         // 服务端有没有 key（null=还不知道）
   var streamEl = null, streamBox = null, streamText = "";
   var confirmId = 0, confirmSession = "";
   var plainOn = true;
@@ -251,7 +255,7 @@
       var data = null;
       try { data = x.responseText ? JSON.parse(x.responseText) : null; } catch (e) { data = null; }
       if (x.status >= 200 && x.status < 300) { if (ok) ok(data); }
-      else if (fail) fail(x);
+      else if (fail) fail(x, data);
     };
     x.send(body === null || body === undefined ? null : JSON.stringify(body));
   }
@@ -430,6 +434,10 @@
         if (!busy && streamEl) { /* 等 turn_end 事件收尾 */ }
       }
       $("foot").textContent = "已连接 · " + (d.model || "");
+      if (d.has_key === false && hasKey !== false) {
+        $("stat").textContent = "还没有 API Key —— 填进 config.txt 后点右上角「刷新」";
+      }
+      hasKey = (d.has_key !== false);
     }, function () {
       $("foot").textContent = "连接断开，重启 web.cmd 后用窗口里的地址";
     });
@@ -577,12 +585,26 @@
   }
 
   // ---------- 发送 ----------
-  function sendNow() {
-    if (!current) { $("stat").textContent = "先新建或选一个会话"; return; }
-    var t = $("input").value;
-    if (!t.replace(/\s/g, "")) return;
+  function reloadConfig(cb) {
+    xhr("POST", api("/api/reload"), {}, function (d) {
+      if (d && d.ok) {
+        $("stat").textContent = d.has_key
+          ? ("已读取配置 · 模型 " + (d.model || "?") + " · 可以发了")
+          : "还是没有 API Key：把 sk-... 粘进 config.txt 的 api_key = 后面，再点刷新";
+        $("reloadBtn").className = d.has_key ? "on" : "";
+      } else {
+        $("stat").textContent = "刷新失败";
+      }
+      if (cb) cb(d);
+    }, function () {
+      $("stat").textContent = "刷新失败（连不上服务）";
+      if (cb) cb(null);
+    });
+  }
+
+  function doSend(text, retried) {
     $("stat").textContent = "发送中…";
-    xhr("POST", api("/api/chat"), { text: t, session: current }, function (d) {
+    xhr("POST", api("/api/chat"), { text: text, session: current }, function (d) {
       if (d && d.ok) {
         $("input").value = "";
         busy = true;
@@ -591,9 +613,34 @@
       } else {
         $("stat").textContent = (d && d.error) || "发送失败";
       }
-    }, function (x) {
-      $("stat").textContent = "连不上服务（" + (x ? x.status : "?") + "），重启一次 web.cmd 试试";
+    }, function (x, d) {
+      // v2.3.5：没 key 时自动重读一次 config.txt，读到就重试（不用重启 web.cmd）
+      if (d && d.need_key && !retried) {
+        $("stat").textContent = "还没有 API Key，正在重新读取 config.txt…";
+        reloadConfig(function (info) {
+          if (info && info.has_key) doSend(text, true);
+        });
+        return;
+      }
+      $("stat").textContent = (d && d.error) ||
+        ("连不上服务（" + (x ? x.status : "?") + "），重启一次 web.cmd 试试");
     });
+  }
+
+  function sendNow() {
+    var t = $("input").value;
+    if (!t.replace(/\s/g, "")) return;
+    if (current) { doSend(t, false); return; }
+    // 一个会话都没开的时候，回车也应该能用：先建一个再发
+    xhr("POST", api("/api/new"), {}, function (d) {
+      if (d && d.ok) {
+        current = d.session;
+        seqMap[d.session] = 0;
+        doSend(t, false);
+      } else {
+        $("stat").textContent = "新建会话失败";
+      }
+    }, function () { $("stat").textContent = "连不上服务，重启一次 web.cmd 试试"; });
   }
 
   function isEnter(ev) { return ev.key === "Enter" || ev.keyCode === 13 || ev.which === 13; }
@@ -641,6 +688,7 @@
     try { localStorage.setItem("ember.plain", on ? "1" : "0"); } catch (e) {}
   }
   $("plainBtn").onclick = function () { applyPlain(!plainOn); };
+  $("reloadBtn").onclick = function () { reloadConfig(null); };
 
   function deleteSession(name) {
     if (!confirm("删除这个会话？\n" + name + "\n（连带归档，删了不能恢复）")) return;

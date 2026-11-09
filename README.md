@@ -39,11 +39,13 @@ start.cmd  run.cmd  web.cmd  resume.cmd  diagnose.cmd  run.bat  launch.vbs
 config.txt         所有设置（含 key）
 README-FIRST.txt   给最终用户的说明书（比这份详细）
 program/           程序本体
-  agent.py         agent 主程序（单文件，~4700 行）
+  agent.py         agent 主程序（单文件，~5000 行）
   doctools.py      Word / Excel / PPT / PDF 工具（纯标准库）
+  find_python.cmd  启动器共用的"挑一个能跑的 Python"
   prompt.txt       系统提示词，记事本可改
   webui.html       网页终端前端（单文件，ES5）
   tools/           自检、打包、UCRT 抓取
+logs/              运行日志：crash-*.log（崩溃栈）/ run-YYYYMMDD.log（每次退出一行）
 docs/              设计笔记
 ```
 
@@ -57,7 +59,7 @@ py\python.exe program\agent.py --doctor
 
 :: 命令行 / 网页
 py\python.exe program\agent.py
-py\python.exe program\agent.py --web 8765
+py\python.exe program\agent.py --web 8765     :: 没 key 也能先开起来，填完点「刷新」
 
 :: 文档工具
 py\python.exe program\doctools.py read    报告.docx
@@ -70,12 +72,19 @@ py\python.exe program\doctools.py convert 旧文件.doc docx
 ## 自检
 
 ```bat
-py\python.exe program\tools\selftest.py     :: 184 项（工具/中断/超时/压缩/文档/PDF/启动器）
-py\python.exe program\tools\test_web.py     :: 22 项（网页 API、多会话并行、删除/改名）
+py\python.exe program\tools\selftest.py     :: 196 项（工具/中断/超时/压缩/文档/PDF/坏会话/启动器）
+py\python.exe program\tools\test_web.py     :: 30 项（网页 API、多会话并行、坏会话、key 重读）
 ```
 
-打包前会跑 7 项冒烟：解压后 `--check-key`、`py32` 能起、`doctools` 能导入、
-跑一次 `run.cmd` 后启动文件哈希不变、`diagnose.cmd` 跑完全程、`webui.html` 的 JS 语法检查。
+打包前会跑 9 项冒烟：解压后 `--check-key`、`py32` 能起、`doctools` 能导入、
+跑一次 `run.cmd` 后启动文件哈希不变、`diagnose.cmd` 跑完全程、`webui.html` 的 JS 语法检查、
+README 里提到的路径都真实存在、`web.cmd` 真能起服务并打出地址。
+
+## 出问题时
+
+`logs\run-YYYYMMDD.log` 每次退出都会追加一行：退出码、原因、模式、stdin 是否控制台、
+会话、内存、运行时长、最后一条输入。崩了还会多一个 `logs\crash-*.log`（完整栈）。
+把这两个文件发出来，比"它闪退了"有用得多。
 
 ## 已知边界
 

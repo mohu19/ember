@@ -36,6 +36,33 @@
 配置开关都在 config.txt（记事本改）。系统提示词在 prompt.txt（记事本改，可多行，
 以 # 或 // 开头的行会被忽略）。程序还会在末尾自动追加一段"运行环境事实"。
 
+v2.4.0（一轮批判性收尾）:
+    * 会话标题加 mtime 缓存：列会话不再每个会话开一次文件（老机器每 1.5 秒省几十次 IO）
+    * 网页事件单体截断到 8000 字：工具输出再大也不会把内存/传输撑爆
+    * 文档防护：单个部件 >64MB、总量 >160MB、含 DTD/实体声明的文档直接拒绝；PDF >80MB 拒读
+    * 打包冒烟从 7 项加到 9 项：README 里提到的路径必须存在、web.cmd 真能起服务
+    * 自检新增 find_python 兜底（没自带运行时能退到系统 Python）与 DTD 拦截
+v2.3.7（启动器不再猜位数）:
+    * 新增 program\find_python.cmd：直接试跑 py / py32，谁能跑用谁，不再看 PROCESSOR_ARCHITECTURE
+    * 两个都跑不起来 → 先补 UCRT 再试 → 再退到系统里装的 py -3 / python
+    * 四个启动脚本 + diagnose 全部改用它；找不到运行时的新提示会列出找过哪些路径
+v2.3.6（退出记录）:
+    * 新增 logs/ 目录：crash-*.log（崩溃栈）+ run-YYYYMMDD.log（每次退出记一行）
+    * 面包屑包含：时间/版本/退出码/退出原因/模式/stdin是否控制台/会话/条数/内存/运行时长/最后输入
+    * 退出原因覆盖：/exit、EOF、连按两次 Ctrl+C、Ctrl+C、未捕获异常、网页服务停止
+v2.3.5（后填 key 不用重启）:
+    * 网页终端每 1.5 秒顺手重读一次 config.txt；发消息前、点「刷新」时也会重读
+    * 没 key 时按回车不再没反应：弹一句「填进 config.txt 后点刷新」，
+      读到 key 会自动重试这一条，不用重启 web.cmd
+    * 一个会话都没开时按回车会先自动建会话再发
+    * 右上角新增「刷新」按钮
+v2.3.4（坏会话 + 闪退加固）:
+    * 会话里 assistant 声明了 tool_calls 却没有回账时，以前每次打开都 400：
+      现在 sanitize_history 会补齐/丢弃/合并，保证发出去的消息序列一定合法，
+      修完立刻写回文件（不再每次打开重修）
+    * 发请求的唯一出口 api_stream 再加一道兜底：坏历史不许出门
+    * 闪退：新增 crash-*.log（主线程 + 子线程异常都记），退出时 atexit 强制落盘
+    * 控制台被关/编码异常不再打死程序；/context /compact /history /save 各自有护栏
 v2.3.3（修网页终端整体失灵）:
     * webui.html 里给老 IE 的提示串写坏了（单引号没转义），整段 JS 语法错误，
       结果是所有事件都没绑上：回车变成换行、按钮没反应
@@ -163,6 +190,7 @@ v1.2 修复: assistant/tool 回复没写回 history（存档里只有 user）
 import hashlib
 import json
 import locale
+import atexit
 import os
 import platform
 import re
@@ -174,6 +202,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -183,7 +212,7 @@ try:  # Windows 控制台按键（Linux/macOS 上没这个模块）
 except ImportError:  # pragma: no cover
     msvcrt = None
 
-VERSION = "2.3.3"
+VERSION = "2.4.0"
 
 # ---------------- 基本路径 ----------------
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -297,6 +326,133 @@ _ACTIVE_LOCAL = threading.local()   # v2.1：每个会话线程各记各的子�
 
 
 # ---------------- 控制台兼容 ----------------
+LOG_DIR = os.path.join(BASE, "logs")
+RUN_STATE = {
+    "mode": "cmd",
+    "reason": "",
+    "code": None,
+    "last_input": "",
+    "session": "",
+    "items": 0,
+    "started": time.time(),
+}
+
+
+def _log_dir():
+    try:
+        if not os.path.isdir(LOG_DIR):
+            os.makedirs(LOG_DIR)
+    except Exception:
+        pass
+    return LOG_DIR
+
+
+def _mem_mb():
+    """当前进程占用的内存（取不到就返回 0，别为了日志把自己搞崩）。"""
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        pmc = PMC()
+        pmc.cb = ctypes.sizeof(PMC)
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        handle = k32.GetCurrentProcess()
+        try:
+            fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        except AttributeError:
+            fn = ctypes.windll.kernel32.K32GetProcessMemoryInfo
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(PMC), ctypes.c_ulong]
+        fn.restype = ctypes.c_int
+        if fn(ctypes.c_void_p(handle), ctypes.byref(pmc), pmc.cb):
+            return int(pmc.WorkingSetSize / 1048576)
+    except Exception:
+        pass
+    return 0
+
+
+def breadcrumb_text():
+    """退出/崩溃时记一行：时间、版本、退出码、原因、环境、最后输入、内存。"""
+    try:
+        stdin_tty = _has_console_stdin()
+    except Exception:
+        stdin_tty = False
+    try:
+        last = str(RUN_STATE.get("last_input") or "")[:80].replace("\n", " ")
+        uptime = int(time.time() - RUN_STATE.get("started") or 0)
+    except Exception:
+        last, uptime = "", 0
+    return ("%s | v%s | 退出码=%s | 原因=%s | 模式=%s | stdin控制台=%s | 会话=%s | "
+            "条数=%s | 内存=%dMB | 运行=%ds | 最后输入=%r"
+            % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION, RUN_STATE.get("code"),
+               RUN_STATE.get("reason") or "-", RUN_STATE.get("mode"),
+               "是" if stdin_tty else "否", RUN_STATE.get("session") or "-",
+               RUN_STATE.get("items"), _mem_mb(), uptime, last))
+
+
+def _write_breadcrumb():
+    """把这一行的退出记录追加到 logs/run-YYYYMMDD.log。"""
+    try:
+        path = os.path.join(_log_dir(), "run-%s.log" % time.strftime("%Y%m%d"))
+        with open(path, "a", encoding="utf-8", newline="\r\n") as fh:
+            fh.write(breadcrumb_text() + "\n")
+    except Exception:
+        pass
+
+
+def _crash_log(exc_type, exc, tb):
+    """把致命异常写到 logs/crash-*.log（同一行面包屑 + 完整栈）。"""
+    path = ""
+    try:
+        path = os.path.join(_log_dir(), "crash-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(breadcrumb_text() + "\n")
+            fh.write("argv: %r\n" % (sys.argv,))
+            fh.write("python: %s\n\n" % sys.version.replace("\n", " "))
+            traceback.print_exception(exc_type, exc, tb, file=fh)
+    except Exception:
+        path = ""
+    try:
+        print("\n[崩溃] 详细信息已写到: %s" % (path or "(写不出来)"))
+        print("        logs 文件夹里还有 run-*.log，能看出是哪一条退出路径。")
+    except Exception:
+        pass
+
+
+def _install_crash_log():
+    def hook(exc_type, exc, tb):
+        if exc_type is KeyboardInterrupt:
+            return
+        RUN_STATE["reason"] = RUN_STATE.get("reason") or "未捕获异常"
+        RUN_STATE["code"] = RUN_STATE.get("code") or 1
+        _crash_log(exc_type, exc, tb)
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
+    try:
+        def thook(args):
+            if args.exc_type is SystemExit:
+                return
+            _crash_log(args.exc_type, args.exc_value, args.exc_traceback)
+            RUN_STATE["reason"] = "子线程异常（进程还在跑）"
+        threading.excepthook = thook
+    except Exception:
+        pass
+
+
 def _init_console():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -682,6 +838,12 @@ class StatusLine(object):
 
     def write(self, text, color=None):
         """写正文（模型吐出来的字）。会先把状态行清掉。"""
+        try:
+            self._write(text, color)
+        except (OSError, ValueError, UnicodeError):
+            pass            # v2.3.4：控制台被关掉/编码炸了，绝不能因此退出
+
+    def _write(self, text, color=None):
         if not text:
             return
         if current_conv() is not None:
@@ -695,6 +857,12 @@ class StatusLine(object):
 
     def log(self, text, color=None):
         """打一整行普通输出（会先收拾状态行 / 补上被吞掉的换行）。"""
+        try:
+            self._log(text, color)
+        except (OSError, ValueError, UnicodeError):
+            pass
+
+    def _log(self, text, color=None):
         conv = current_conv()
         if conv is not None:                 # 网页里进当前会话的日志
             if UI is not None:
@@ -1931,19 +2099,154 @@ def trim_history(history, session_path=None):
 
 
 def sanity_check_history(history):
-    known = set()
+    """返回 (是否合法, 原因)。
+
+    v2.3.4：以前只查"孤立 tool"，漏了反过来的那种 —— assistant 声明了 tool_calls
+    却没有对应的 tool 回账（进程被杀就会出现）。这种历史一发给 API 就是 400，
+    而且是**每次打开都 400**。现在两种都查，并且要求 tool 紧跟在 assistant 后面。
+    """
+    pending = []
     for msg in history:
-        if msg.get("role") == "assistant":
-            for call in (msg.get("tool_calls") or []):
-                if call.get("id"):
-                    known.add(call["id"])
-        elif msg.get("role") == "tool":
-            if msg.get("tool_call_id") not in known:
-                return False, "孤立 tool 消息: %s" % msg.get("tool_call_id")
+        role = msg.get("role")
+        if role == "assistant":
+            if pending:
+                return False, "上一次工具调用没有回结果: %s" % ",".join(pending)
+            ids = [c.get("id") for c in (msg.get("tool_calls") or []) if c.get("id")]
+            pending = list(ids)
+        elif role == "tool":
+            cid = msg.get("tool_call_id")
+            if cid not in pending:
+                return False, "孤立 tool 消息: %s" % cid
+            pending.remove(cid)
+        elif role == "user" and pending:
+            return False, "工具调用后面直接跟了用户消息: %s" % ",".join(pending)
+    if pending:
+        return False, "上一次工具调用没有回结果: %s" % ",".join(pending)
     return True, "ok"
 
 
+def sanitize_history(history, note=None):
+    """把历史整理成"任何 API 都一定接受"的结构，返回改了几处。
+
+    这是最后一道保险：不管是进程被杀、手改文件、跨版本迁移，还是写到一半断电，
+    只要经过这里，发出去的消息序列就是合法的。
+
+    规则：
+      1) 丢掉角色不认识的消息
+      2) assistant 的 tool_calls 去重、去掉没 id 的；空的 tool_calls 字段删掉
+      3) 每个 assistant(tool_calls) 后面按顺序补齐缺失的 tool 回账（紧跟其后）
+      4) 不属于上一条 assistant 的 tool 消息丢掉
+      5) 空的 assistant（无正文、无 tool_calls）丢掉
+      6) 连续的同角色纯文本消息合并
+      7) 第一条非 system 消息必须是 user
+    """
+    note = note or ("（这次工具调用执行到一半会话中断了，没有拿到结果；需要的话重新调用一次）")
+    fixed = 0
+
+    # ---- 第一遍：清洗单条消息 ----
+    stage = []
+    for msg in history:
+        role = msg.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            fixed += 1
+            continue
+        if role == "assistant":
+            calls = msg.get("tool_calls") or []
+            seen, keep = set(), []
+            for c in calls:
+                cid = (c or {}).get("id")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                keep.append(c)
+            if len(keep) != len(calls):
+                msg = dict(msg)
+                fixed += 1
+                if keep:
+                    msg["tool_calls"] = keep
+                else:
+                    msg.pop("tool_calls", None)
+            if not str(msg.get("content") or "").strip() and not msg.get("tool_calls"):
+                fixed += 1
+                continue
+        stage.append(msg)
+
+    # ---- 第二遍：tool 必须紧跟在声明它的 assistant 之后 ----
+    out = []
+    pending = []
+    for msg in stage:
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            for cid in pending:
+                out.append({"role": "tool", "tool_call_id": cid, "content": note})
+                fixed += 1
+            pending = []
+            out.append(msg)
+            pending = [c.get("id") for c in msg["tool_calls"] if c.get("id")]
+            continue
+        if role == "tool":
+            cid = msg.get("tool_call_id")
+            if cid in pending:
+                out.append(msg)
+                pending.remove(cid)
+            else:
+                fixed += 1          # 孤儿 tool，丢掉
+            continue
+        if pending:                 # user / assistant(无 calls) / system 打断 => 先补齐
+            for cid in pending:
+                out.append({"role": "tool", "tool_call_id": cid, "content": note})
+                fixed += 1
+            pending = []
+        out.append(msg)
+    for cid in pending:
+        out.append({"role": "tool", "tool_call_id": cid, "content": note})
+        fixed += 1
+
+    # ---- 第三遍：合并连续同角色文本，保证以 user 开头 ----
+    merged = []
+    for msg in out:
+        if (merged and msg.get("role") == merged[-1].get("role")
+                and msg.get("role") in ("user", "assistant")
+                and not msg.get("tool_calls") and not merged[-1].get("tool_calls")):
+            prev = merged[-1]
+            add = str(msg.get("content") or "").strip()
+            if add:
+                merged[-1] = dict(prev, content=(str(prev.get("content") or "").rstrip()
+                                                 + "\n\n" + add).strip())
+                fixed += 1
+                continue
+        merged.append(msg)
+
+    start = 0
+    while start < len(merged) and merged[start].get("role") == "system":
+        start += 1
+    if start < len(merged) and merged[start].get("role") != "user":
+        merged.insert(start, {"role": "user", "content": "（继续）"})
+        fixed += 1
+
+    if fixed or len(merged) != len(history):
+        history[:] = merged
+    return fixed
+
+
 # ---------------- 路径 ----------------
+def reload_api_credentials():
+    """重新读 config.txt 里的 api_key / api_base / model。
+
+    网页终端是长驻进程，启动时读一次 key；用户后填 key（记事本改 config.txt 或
+    另开命令行 --set-key）之后，不重启也能用 —— 发消息前、点"刷新"时都会调这里。
+    """
+    global API_KEY, API_BASE
+    try:
+        cfg = load_config()
+        API_KEY = load_key(cfg)
+        API_BASE = (cfg.get("api_base") or CONFIG_DEFAULTS["api_base"]).strip().rstrip("/")
+        model = (cfg.get("model") or CONFIG_DEFAULTS["model"]).strip()
+    except Exception:
+        return {"has_key": bool(API_KEY), "api_base": API_BASE, "model": ""}
+    return {"has_key": bool(API_KEY), "api_base": API_BASE, "model": model}
+
+
 def resolve_path(path, must_exist=False):
     if not path:
         path = "."
@@ -2623,6 +2926,8 @@ def _open_stream(req, started):
 
 
 def api_stream(messages, model, thinking, use_tools):
+    # v2.3.4：这里是对模型说话的唯一出口，坏历史不许出门
+    sanitize_history(messages)
     body = {"model": model, "messages": messages, "stream": True, "max_tokens": MAX_TOKENS}
     if not thinking and supports_reasoning_effort():
         body["reasoning_effort"] = "none"
@@ -3009,38 +3314,13 @@ def load_session(path):
 
 
 def repair_history(history, journal=None, tail_note=None):
-    """把"中途被关掉"留下的半截历史补成 API 能接受的样子（v1.6）。
+    """把半截历史补成 API 能接受的样子，返回改了几处。
 
-    两种残缺：
-      1) assistant 声明了 tool_calls，但 tool 结果没写进去就断了 -> 补一条"没拿到结果"
-         （不补的话，下一次请求会因为孤立 tool_call 直接 400）
-      2) 最后一条是 user（提问发出去了，回答还没开始/没写完）-> 补一条 assistant 说明
-    返回补了几条，方便界面上提示一句。
+    v2.3.4：先跑 sanitize_history 做**结构化修复**（补齐/丢弃 tool 回账、去重、
+    合并），再补"上次被关掉"的说明。以前只往末尾追加 tool 占位，
+    如果那条 user 夹在中间，补完还是非法 —— 于是每次打开都 400。
     """
-    fixed = 0
-    answered = {}
-    for msg in history:
-        if msg.get("role") == "assistant":
-            for call in (msg.get("tool_calls") or []):
-                if call.get("id"):
-                    answered[call["id"]] = False
-        elif msg.get("role") == "tool":
-            cid = msg.get("tool_call_id")
-            if cid in answered:
-                answered[cid] = True
-    # v1.9：先删掉"id 根本不存在"的孤立 tool（手改会话 / 跨版本迁移会造出来）
-    known = set(answered)
-    if any(m.get("role") == "tool" and m.get("tool_call_id") not in known for m in history):
-        cleaned = [m for m in history
-                   if not (m.get("role") == "tool" and m.get("tool_call_id") not in known)]
-        fixed += len(history) - len(cleaned)
-        history[:] = cleaned
-    for cid, done in answered.items():
-        if not done:
-            remember(history, {"role": "tool", "tool_call_id": cid,
-                               "content": "（会话在这次工具调用执行期间被关闭，没有拿到结果；"
-                                          "需要的话重新调用一次）"}, journal)
-            fixed += 1
+    fixed = sanitize_history(history)
     if history and history[-1].get("role") == "user" and not is_summary_msg(history[-1]):
         remember(history, {"role": "assistant",
                            "content": tail_note or
@@ -3061,10 +3341,18 @@ def heal_history(history):
 
 
 def resume_history(path):
-    """载入会话：按当前提示词重建 system + 修补半截历史。返回 (history, 补了几条)。"""
+    """载入会话：按当前提示词重建 system + 修补半截历史。返回 (history, 补了几条)。
+
+    v2.3.4：修完立刻写回文件。以前只在内存里修，用户如果只是打开看看、没发消息，
+    文件还是坏的，下次打开继续 400。
+    """
     history = ensure_system(load_session(path))
     fixed = repair_history(history)
-    fixed += heal_history(history)
+    if fixed:
+        try:
+            save_session(path, history)
+        except Exception:
+            pass
     return history, fixed
 
 
@@ -3466,12 +3754,27 @@ def title_path(session_path):
     return os.path.splitext(session_path)[0] + ".title"
 
 
+_TITLE_CACHE = {}
+
+
 def read_title(session_path):
+    """读会话标题（带 mtime 缓存；网页每 1.5 秒列一次会话，别每次都开文件）。"""
+    p = title_path(session_path)
     try:
-        with open(title_path(session_path), "r", encoding="utf-8") as fh:
-            return fh.read().strip()
+        st = os.stat(p)
+    except OSError:
+        _TITLE_CACHE.pop(p, None)
+        return ""
+    hit = _TITLE_CACHE.get(p)
+    if hit and hit[0] == st.st_mtime:
+        return hit[1]
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            text = fh.read().strip()
     except (IOError, OSError):
         return ""
+    _TITLE_CACHE[p] = (st.st_mtime, text)
+    return text
 
 
 def default_display_name(name):
@@ -3654,6 +3957,17 @@ def interactive(model, thinking, use_tools, session_file, history):
     global AUTO_APPROVE
     # 每产生一条消息就落盘（session_file 变量在 /new 时会被改，闭包跟着走新文件）
     journal = lambda msg: append_message(session_file, msg)
+    RUN_STATE["mode"] = "cmd"
+    RUN_STATE["session"] = os.path.basename(session_file)
+    # v2.3.4：不管怎么退出（含异常、关窗口、Ctrl+C），都把整段历史写回去
+    _live = {"file": session_file}
+
+    def _save_on_exit():
+        try:
+            save_session(_live["file"], history)
+        except Exception:
+            pass
+    atexit.register(_save_on_exit)
     STATUS.log("ember v%s  %s" % (VERSION, config_summary(model, thinking, use_tools)),
                color="tool")
     STATUS.log("默认目录: %s" % WORKSPACE, color="dim")
@@ -3676,17 +3990,21 @@ def interactive(model, thinking, use_tools, session_file, history):
             except KeyboardInterrupt:
                 now = time.time()
                 if now - last_ctrlc < 3:
+                    RUN_STATE["reason"] = "连按两次 Ctrl+C"
                     print()
                     break
                 last_ctrlc = now
                 STATUS.log("(想退出：3 秒内再按一次 Ctrl+C，或输入 /exit)", color="dim")
                 continue
             except EOFError:
+                RUN_STATE["reason"] = "stdin 结束（EOF，可能是输入被重定向/接管）"
                 print()
                 break
+        RUN_STATE["last_input"] = user
         if not user:
             continue
         if user in ("/exit", "/quit", "exit", "quit"):
+            RUN_STATE["reason"] = "用户输入 /exit"
             break
         if user in ("/stop", "/abort"):
             STATUS.log("(现在没有在运行的任务；运行中敲 /stop 才会中断)", color="dim")
@@ -3700,11 +4018,18 @@ def interactive(model, thinking, use_tools, session_file, history):
                        "/history 历史  /save  /exit", color="dim")
             continue
         if user == "/context":
-            STATUS.log(context_report(history, session_path=session_file), color="dim")
+            try:
+                STATUS.log(context_report(history, session_path=session_file), color="dim")
+            except Exception as exc:                 # noqa: BLE001
+                STATUS.log("(统计失败：%s)" % exc, color="warn")
             continue
         if user == "/compact":
-            ok, n = compact_history(history, model, force=True,
-                                    journal=journal, session_path=session_file)
+            try:
+                ok, n = compact_history(history, model, force=True,
+                                        journal=journal, session_path=session_file)
+            except Exception as exc:                 # noqa: BLE001
+                STATUS.log("(压缩失败：%s —— 历史没动，接着聊就行)" % exc, color="warn")
+                continue
             if ok:
                 STATUS.log("(已压缩：摘要 %d 字，接着聊就行)" % n, color="dim")
             else:
@@ -3729,12 +4054,18 @@ def interactive(model, thinking, use_tools, session_file, history):
             tools = sum(1 for m in history if m.get("role") == "tool")
             STATUS.log("(历史 %d 条，上限 %d；另有工具结果 %d 条，只显示对话)"
                        % (len(history), MAX_HISTORY, tools), color="dim")
-            print_transcript(history, max_msgs=None if show_all else 20,
-                             per_msg=200 if show_all else 160)
+            try:
+                print_transcript(history, max_msgs=None if show_all else 20,
+                                 per_msg=200 if show_all else 160)
+            except Exception as exc:                 # noqa: BLE001
+                STATUS.log("(显示历史失败：%s)" % exc, color="warn")
             continue
         if user == "/new":
             history[:] = new_history()
             session_file = new_session_file()
+            _live["file"] = session_file
+            RUN_STATE["session"] = os.path.basename(session_file)
+            RUN_STATE["items"] = 0
             STATUS.log("(已开新会话)", color="dim")
             continue
         if user.startswith("/model"):
@@ -3756,7 +4087,12 @@ def interactive(model, thinking, use_tools, session_file, history):
                        % ("开 —— 不再逐条确认" if AUTO_APPROVE else "关"), color="dim")
             continue
         if user == "/save":
-            save_session(session_file, history)
+            try:
+                save_session(session_file, history)
+            except Exception as exc:                 # noqa: BLE001
+                STATUS.log("(保存失败：%s —— 可能是文件被占用/磁盘满)" % exc, color="warn")
+                continue
+            _live["file"] = session_file
             STATUS.log("(已保存 %s)" % os.path.basename(session_file), color="dim")
             continue
 
@@ -3806,13 +4142,22 @@ def interactive(model, thinking, use_tools, session_file, history):
         if not ok:
             fixed = heal_history(history)
             STATUS.log("(历史自检异常（%s），已修 %d 条)" % (why, fixed), color="warn")
-        save_session(session_file, history)
+        try:
+            save_session(session_file, history)
+        except Exception as exc:                     # noqa: BLE001
+            STATUS.log("(本轮没保存成功：%s —— 检查磁盘空间/只读)" % exc, color="warn")
         # v2.0.3：第一次成功对话后，后台起个标题（不挡下一句）
         if not read_title(session_file):
             threading.Thread(target=ensure_title,
                              args=(session_file, list(history), model),
                              daemon=True).start()
-    save_session(session_file, history)
+    RUN_STATE["items"] = len(history)
+    try:
+        save_session(session_file, history)
+    except Exception:
+        pass
+    if not RUN_STATE["reason"]:
+        RUN_STATE["reason"] = "会话循环结束"
     STATUS.log("(会话已保存: %s)" % os.path.basename(session_file), color="dim")
 
 
@@ -3951,6 +4296,9 @@ class WebUI(object):
             ev = dict(kw)
             ev["seq"] = conv.seq
             ev["kind"] = kind
+            for _k, _v in list(ev.items()):
+                if isinstance(_v, str) and len(_v) > 8000:
+                    ev[_k] = _v[:8000] + "…（事件里已截断，完整内容在会话文件里）"
             conv.events.append(ev)
             if len(conv.events) > 4000:      # 长会话别把内存堆爆
                 del conv.events[:2000]
@@ -3974,10 +4322,21 @@ class WebUI(object):
         with conv.lock:
             if conv.history is None:
                 conv.history = ensure_system(load_session(path))
-                repair_history(conv.history)
+                fixed = repair_history(conv.history)
+                if fixed:                      # v2.3.4：修完就落盘，不然每次打开都 400
+                    try:
+                        save_session(path, conv.history)
+                    except Exception:
+                        pass
             conv.unread = False
         self.active = name
         return conv
+
+    def reload(self):
+        info = reload_api_credentials()
+        if info.get("model"):
+            self.model = info["model"]
+        return info
 
     def new(self):
         name = os.path.basename(new_session_file())
@@ -4166,6 +4525,7 @@ def run_web(port, model, thinking, use_tools, open_browser=True):
         return 1
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    RUN_STATE["mode"] = "web"
     ui = WebUI()
     ui.model, ui.thinking, ui.use_tools = model, thinking, use_tools
     UI = ui
@@ -4237,11 +4597,13 @@ def run_web(port, model, thinking, use_tools, open_browser=True):
                 return
             q = urllib.parse.parse_qs(parsed.query)
             if parsed.path == "/api/state":
+                ui.reload()          # v2.3.5：每 1.5 秒顺手看一眼 config.txt，后填的 key 自动生效
                 conv = ui.conv(ui.active) if ui.active else None
                 self._send(200, {
                     "ok": True, "active": ui.active,
                     "busy": bool(conv and conv.busy),
                     "session": ui.active, "model": ui.model, "version": VERSION,
+                    "has_key": bool(API_KEY),
                     "ctx": estimate_tokens(conv.history) if conv and conv.history else 0,
                     "sessions": session_list(),
                 })
@@ -4297,12 +4659,21 @@ def run_web(port, model, thinking, use_tools, open_browser=True):
             if path == "/api/chat":
                 text = str(body.get("text") or "").strip()
                 target = str(body.get("session") or ui.active or "")
+                info = ui.reload()          # v2.3.5：先看看 key 是不是刚填好
+                if text and not info["has_key"]:
+                    self._send(400, {"ok": False, "need_key": True,
+                                     "error": "还没有 API Key：填进 config.txt 后点右上角「刷新」"})
+                    return
                 ok, err = ui.start_chat(text, target) if text else (False, "空消息")
                 self._send(200 if ok else (400 if not text else 409),
                            {"ok": ok, "error": err, "session": target})
             elif path == "/api/new":
                 conv = ui.new()
                 self._send(200, {"ok": True, "session": conv.name})
+            elif path == "/api/reload":
+                info = ui.reload()
+                self._send(200, {"ok": True, "has_key": info["has_key"],
+                                 "model": info["model"], "api_base": info["api_base"]})
             elif path == "/api/stop":
                 conv = ui.conv(body.get("session") or ui.active)
                 if conv is not None:
@@ -4361,10 +4732,12 @@ def run_web(port, model, thinking, use_tools, open_browser=True):
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        pass
+        RUN_STATE["reason"] = "Ctrl+C 停止网页服务"
     finally:
         httpd.server_close()
         UI = None
+        if not RUN_STATE["reason"]:
+            RUN_STATE["reason"] = "网页服务结束"
     return 0
 
 
@@ -4775,7 +5148,10 @@ def main():
         cfg = load_config()
         apply_config(cfg)
 
-    if not API_KEY:
+    if not API_KEY and web_port:
+        # v2.4：网页可以先开起来再填 key（填完点右上角「刷新」，或等它自动重读）
+        print("（还没有 API Key —— 网页可以照常打开；把 key 填进 config.txt 后点右上角「刷新」）")
+    elif not API_KEY:
         print("没有找到 API Key。三种办法：\n"
               "  1) 双击 run.cmd，首次它会问你\n"
               "  2) 用记事本打开 config.txt，把 api_key = 后面填上 sk-xxxx\n"
@@ -4881,5 +5257,31 @@ def set_auto_approve(value):
     AUTO_APPROVE = bool(value)
 
 
+def _run_main():
+    """跑 main()，不管怎么结束都留一行面包屑（logs/run-YYYYMMDD.log）。"""
+    code = 0
+    try:
+        code = main() or 0
+        RUN_STATE["reason"] = RUN_STATE["reason"] or "正常结束"
+    except KeyboardInterrupt:
+        RUN_STATE["reason"] = "Ctrl+C"
+        code = 130
+        try:
+            print("\n(已退出)")
+        except Exception:
+            pass
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 0
+    except BaseException:
+        RUN_STATE["reason"] = RUN_STATE["reason"] or "未捕获异常（见 crash 日志）"
+        code = 1
+        raise
+    finally:
+        RUN_STATE["code"] = code
+        _write_breadcrumb()
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _install_crash_log()
+    sys.exit(_run_main())
